@@ -22,9 +22,9 @@
 #
 
 import logging
-
 from .enrich import Enrich, metadata
 from grimoirelab_toolkit.datetime import str_to_datetime
+from grimoire_elk.elastic import ElasticSearch
 
 MAX_SIZE_BULK_ENRICHED_ITEMS = 200
 
@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 
 
 class CocomEnrich(Enrich):
+
+    def __init__(self, db_sortinghat=None, db_projects_map=None, json_projects_map=None,
+                 db_user='', db_password='', db_host=''):
+        super().__init__(db_sortinghat, db_projects_map, json_projects_map,
+                         db_user, db_password, db_host)
+
+        self.studies = []
+        self.studies.append(self.enrich_repo_analysis)
 
     def get_identities(self, item):
         """ Return the identities from an item """
@@ -98,7 +106,6 @@ class CocomEnrich(Enrich):
             eitem['commit_sha'] = entry['commit']
             eitem['author'] = entry['Author']
             eitem['committer'] = entry['Commit']
-            eitem['commit'] = entry['commit']
             eitem['message'] = entry['message']
             eitem['author_date'] = self.__fix_field_date(entry['AuthorDate'])
             eitem['commit_date'] = self.__fix_field_date(entry['CommitDate'])
@@ -157,6 +164,105 @@ class CocomEnrich(Enrich):
             logger.info("%s items inserted for Cocom", str(num_items))
 
         return num_items
+
+    def enrich_repo_analysis(self, ocean_backend, enrich_backend, no_incremental=False,
+                             out_index="cocom_enrich_graal_repo",
+                             date_field="grimoire_creation_date"):
+
+        logger.info("Doing enrich_repository_analysis study for index {}"
+                    .format(self.elastic.anonymize_url(self.elastic.index_url)))
+
+        enriched_items = [eitem for eitem in enrich_backend.fetch()]
+        enriched_items = sorted(enriched_items, key=lambda k: k["commit_date"])
+        elastic_out = ElasticSearch(enrich_backend.elastic.url, out_index)
+
+        # EVOLUTION: No Incremental
+        evolution_items = []
+
+        # origin -> file -> details
+        cache_dict = dict()
+        metrics = ["ccn", "num_funs", "tokens", "loc", "comments", "blanks"]
+        num_items = 0
+        ins_items = 0
+
+        for eitem in enriched_items:
+            evolution_item = {
+                "id": eitem['id'],
+                "commit_sha": eitem["commit_sha"],
+                "origin": eitem["origin"],
+                "file_path": eitem["file_path"],
+                "modules": eitem["modules"],
+                "author_date": eitem["author_date"],
+                "commit_date": eitem["commit_date"],
+                "metadata__updated_on": eitem["metadata__updated_on"]
+            }
+            file_level_detail = {}
+
+            for metric in metrics:
+                if eitem[metric] is not None:
+                    file_level_detail[metric] = eitem[metric]
+                else:
+                    file_level_detail[metric] = 0
+
+            # Update cache Dict
+            if cache_dict.get(eitem["origin"], False):
+                # origin entry found
+                if cache_dict[eitem["origin"]].get(eitem["file_path"], False):
+                    # file entry found
+                    for metric in metrics:
+                        cache_dict[eitem["origin"]]["total_" + metric] += \
+                            (file_level_detail[metric] - cache_dict[eitem["origin"]][eitem["file_path"]][metric])
+                else:
+                    # new file entry
+                    for metric in metrics:
+                        cache_dict[eitem["origin"]]["total_" + metric] += file_level_detail[metric]
+            else:
+                # new origin
+                cache_dict[eitem["origin"]] = {}
+                for metric in metrics:
+                    cache_dict[eitem["origin"]]["total_" + metric] = file_level_detail[metric]
+
+            for metric in metrics:
+                evolution_item["total_" + metric] = cache_dict[eitem["origin"]]["total_" + metric]
+
+            if eitem["loc"] is None:
+                # Deleted file entry
+                cache_dict[eitem["origin"]].pop(eitem["file_path"], None)
+                for metric in metrics:
+                    file_level_detail[metric] = None
+            else:
+                cache_dict[eitem["origin"]][eitem["file_path"]] = file_level_detail
+
+            evolution_item.update(file_level_detail)
+
+            if cache_dict[eitem["origin"]]["total_loc"]:
+                total_lines = cache_dict[eitem["origin"]]["total_loc"] + cache_dict[eitem["origin"]]["total_comments"] + \
+                    cache_dict[eitem["origin"]]["total_blanks"]
+                evolution_item["total_comments_ratio"] = cache_dict[eitem["origin"]]["total_comments"] / total_lines
+                evolution_item["total_blanks_ratio"] = cache_dict[eitem["origin"]]["total_blanks"] / total_lines
+            else:
+                evolution_item["total_comments_ratio"] = cache_dict[eitem["origin"]]["total_comments"]
+                evolution_item["total_blanks_ratio"] = cache_dict[eitem["origin"]]["total_blanks"]
+
+            evolution_item["comments_ratio"] = eitem["comments_ratio"]
+            evolution_item["blanks_ratio"] = eitem["blanks_ratio"]
+
+            evolution_items.append(evolution_item)
+            # PUSH
+            if len(evolution_items) >= self.elastic.max_items_bulk:
+                num_items += len(evolution_items)
+                ins_items += elastic_out.bulk_upload(evolution_items, self.get_field_unique_id())
+                evolution_items = []
+
+        if len(evolution_items) > 0:
+            num_items += len(evolution_items)
+            ins_items += elastic_out.bulk_upload(evolution_items, self.get_field_unique_id())
+
+        if num_items != ins_items:
+            missing = num_items - ins_items
+            logger.error("%s/%s missing items for Study Enricher", str(missing), str(num_items))
+        else:
+            logger.info("%s items inserted for Study Enricher", str(num_items))
 
     def __fix_field_date(self, date_value):
         """Fix possible errors in the field date"""
